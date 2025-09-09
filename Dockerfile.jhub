@@ -1,0 +1,151 @@
+# JupyterHub-compatible development image for BioNeMo
+# This image is intended to be used as a JupyterHub single-user server
+# and a VS Code (via Jupyter / SSH) capable development environment.
+#
+# Key additions:
+#  - Non-root user (jovyan) with writable home
+#  - jupyterhub-singleuser + JupyterLab + common extensions
+#  - Dev tooling (git, bash completions, ipywidgets, formatters)
+#  - Optional SSH server (disabled by default) for VS Code Remote-SSH
+#  - "fix-permissions" helper mimicking the Jupyter Docker Stacks behavior
+#
+# Build:
+#   docker build -t bionemo-jhub -f Dockerfile.jhub .
+# Run (local test):
+#   docker run --gpus all -p 8888:8888 bionemo-jhub jupyter lab --LabApp.token=''
+#
+# When launched by JupyterHub, the entrypoint command is overridden to
+# jupyterhub-singleuser; environment (API tokens etc.) is injected by Hub.
+
+FROM nvcr.io/nvidia/clara/bionemo-framework:nightly
+
+# Avoid interactive prompts during apt operations
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Default notebook user configuration
+ENV SHELL=/bin/bash \
+    NB_USER=container_user \
+    NB_UID=1000 \
+    NB_GID=1000 \
+    HOME=/home/container_user \
+    JUPYTERHUB_SINGLEUSER_APP=jupyter_server.serverapp.ServerApp \
+    PYTHONNOUSERSITE=true
+
+
+# (A) System packages
+# - tini: proper init
+# - sudo: allow optional elevation inside pod
+# - git, openssh-client: dev workflows
+# - openssh-server (commented by default) add --build-arg INSTALL_SSH=1 to enable
+# - curl, less, nano: quality-of-life
+# - libjpeg, libpng: image display support (often already present, idempotent)
+# - locales: enable UTF-8 locale if missing
+ARG INSTALL_SSH=0
+RUN --mount=type=cache,id=apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=apt-lib,target=/var/lib/apt,sharing=locked \
+    set -eux; \
+    apt-get update -qy; \
+    apt-get install -qy --no-install-recommends \
+        tini sudo git curl ca-certificates less nano jq locales \
+        build-essential \
+        libjpeg-dev libpng-dev; \
+    if [ "${INSTALL_SSH}" = "1" ]; then apt-get install -qy --no-install-recommends openssh-server; fi; \
+    sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen || true; \
+    locale-gen; \
+    rm -rf /var/lib/apt/lists/*
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# (B) Create container_user if base image does not already provide it
+RUN set -eux; \
+    if ! id -u "${NB_UID}" >/dev/null 2>&1; then \
+        groupadd -g "${NB_GID}" ${NB_USER}; \
+        useradd -l -m -s /bin/bash -N -u "${NB_UID}" -g "${NB_GID}" ${NB_USER}; \
+    fi; \
+    mkdir -p ${HOME}; \
+    chown -R ${NB_UID}:${NB_GID} ${HOME}
+RUN mkdir -p /home/${NB_USER}/workspace
+WORKDIR /home/${NB_USER}/workspace
+
+# (C) Helper: fix-permissions script (lightweight adaptation of Jupyter Stacks)
+RUN printf '#!/usr/bin/env bash\nset -euo pipefail\nfor tgt in "$@"; do\n  [ -e "$tgt" ] || continue\n  find "$tgt" -xdev -type d -print0 | xargs -0 chmod 775 || true\n  find "$tgt" -xdev -type f -print0 | xargs -0 chmod 664 || true\n  chown -R ${NB_UID}:${NB_GID} "$tgt" || true\ndone\n' > /usr/local/bin/fix-permissions \
+ && chmod 755 /usr/local/bin/fix-permissions
+
+# (D) Python / Jupyter packages
+# We assume the base image already contains CUDA / PyTorch / framework deps.
+# We keep additions minimal to avoid dependency churn.
+# Pin only where necessary to reduce resolver overhead & instability.
+
+# Environment variables to discourage writing bytecode in shared volumes
+ENV PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Using pip directly (image already manages system Python)
+RUN set -eux; \
+    pip install --no-cache-dir \
+        jupyterhub==5.* \
+        jupyterlab==4.* \
+        notebook==7.* \
+        jupyterlab_git \
+        jupyterlab_code_formatter \
+        jupyterlab_widgets \
+        ipywidgets \
+        jupyter-server-proxy \
+        nbdime \
+        ruff \
+        debugpy \
+        lineapy || true; \
+    # Enable server-side extensions where required
+    jupyter server extension enable --py jupyterlab_code_formatter || true; \
+    jupyter lab build --dev-build=False --minimize=True || true; \
+    # IMPORTANT: Do NOT run fix-permissions on /usr/local/bin or we lose executable bits.
+    fix-permissions /usr/local/share/jupyter ${HOME}; \
+    # Restore execute bits in case a previous build layer stripped them.
+    chmod +x /usr/local/bin/jupyterhub-singleuser /usr/local/bin/jupyter-lab /usr/local/bin/jupyter || true
+
+# Integrate notebook support assets
+COPY notebook/entrypoint.sh /entrypoint.sh
+COPY notebook/jupyter_config.py /usr/etc/jupyter/jupyter_config.py
+COPY notebook/startup_scripts /etc/startup.d
+RUN set -eux; \
+    find /etc/startup.d -type f -name '*.sh' -exec chmod +x {} +; \
+    fix-permissions /etc/startup.d /entrypoint.sh /usr/etc/jupyter; \
+    chmod +x /entrypoint.sh;
+
+# (E) Optional SSHd enablement (only if INSTALL_SSH=1)
+# NOTE: For cluster security, prefer port-forwarding via kubectl or relying on
+# JupyterHub rather than exposing SSH on a NodePort. If enabled, you still need
+# to set a password or mount authorized_keys at runtime.
+RUN if [ "${INSTALL_SSH}" = "1" ]; then \
+      set -eux; \
+      mkdir -p /var/run/sshd; \
+      sed -i 's/#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config; \
+      sed -i 's@session\s*required\s*pam_loginuid.so@session optional pam_loginuid.so@g' /etc/pam.d/sshd || true; \
+      echo 'AllowTcpForwarding yes' >> /etc/ssh/sshd_config; \
+    fi
+
+# (F) VS Code debug adapter (debugpy already installed). VS Code can attach via
+# remote Jupyter kernel or (if SSH enabled) via Remote-SSH. For a direct attach
+# you can run inside a notebook cell: import debugpy; debugpy.listen(("0.0.0.0", 5678))
+EXPOSE 8888
+# Optionally: EXPOSE 22 5678
+
+# Copy (optional) skeleton config (kept minimal)
+RUN mkdir -p ${HOME}/.jupyter/lab/user-settings/@jupyterlab/apputils-extension/ && \
+    printf '{\n  "theme": "JupyterLab Dark"\n}' > ${HOME}/.jupyter/lab/user-settings/@jupyterlab/apputils-extension/themes.jupyterlab-settings && \
+    chown -R ${NB_UID}:${NB_GID} ${HOME}/.jupyter
+
+# Switch to notebook user
+USER ${NB_UID}
+
+# (G) Entrypoint / CMD
+# Use tini for proper signal handling; JupyterHub spawner overrides the command
+# to run `jupyterhub-singleuser`. If you manually run the container you can get
+# a lab server.
+ENTRYPOINT ["tini", "/entrypoint.sh", "--"]
+
+# Notes:
+#  - JupyterHub will inject env vars (JUPYTERHUB_*). The single-user server
+#    command is provided by the jupyterhub package.
+#  - If you need SSH, rebuild with: --build-arg INSTALL_SSH=1 and then run:
+#      docker run -p 2222:22 -e AUTHORIZED_KEYS="$(cat ~/.ssh/id_rsa.pub)" ...
+#    (You would also need to append the key to ~jovyan/.ssh/authorized_keys.)
