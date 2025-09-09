@@ -1,0 +1,1 @@
+ulimit -c 0  # Max core file size
