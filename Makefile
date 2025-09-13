@@ -49,6 +49,7 @@ build:
 	  --network=host \
 	  --platform $(PLATFORM) \
 	  -f $(DOCKERFILE) \
+	  --build-arg BIONEMO_FRAMEWORK_TAG=$(BASE_TAG) \
 	  $(BUILD_ARGS) \
 	  $(LABEL_ARGS) \
 	  -t $(IMAGE_VERSION) .
