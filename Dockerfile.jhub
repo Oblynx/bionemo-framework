@@ -17,7 +17,8 @@
 # When launched by JupyterHub, the entrypoint command is overridden to
 # jupyterhub-singleuser; environment (API tokens etc.) is injected by Hub.
 
-FROM nvcr.io/nvidia/clara/bionemo-framework:nightly
+ARG BIONEMO_FRAMEWORK_TAG=nightly
+FROM nvcr.io/nvidia/clara/bionemo-framework:${BIONEMO_FRAMEWORK_TAG}
 
 # Avoid interactive prompts during apt operations
 ENV DEBIAN_FRONTEND=noninteractive
@@ -30,7 +31,7 @@ ENV SHELL=/bin/bash \
     HOME=/home/container_user \
     JUPYTERHUB_SINGLEUSER_APP=jupyter_server.serverapp.ServerApp \
     PYTHONNOUSERSITE=true
-
+ENV BIONEMO_DIR=/workspace/bionemo2
 
 # (A) System packages
 # - tini: proper init
