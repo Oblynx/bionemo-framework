@@ -28,4 +28,7 @@
     ],
     "autoDocstring.docstringFormat": "google-notypes",
     "search.exclude": { "**/logs/**": true },
+    "chat.tools.terminal.autoApprove": {
+        "cp": true
+    }
 }
