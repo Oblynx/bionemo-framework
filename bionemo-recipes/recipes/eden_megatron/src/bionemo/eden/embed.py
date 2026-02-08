@@ -371,10 +371,9 @@ def embed(
         if embedding_layer > 0:
             config_modifiers_init["num_layers"] = embedding_layer
         elif embedding_layer == 0:
-            # Just embedding layer, no decoder layers needed?
-            # We'll set num_layers=1 and just skip it in forward if needed, or rely on logic.
-            # But usually config.num_layers must be >= 1 for validation.
-            pass
+            # For embedding-only extraction, we still need at least 1 decoder layer
+            # for config validation, but forward_for_embeddings will exit early
+            config_modifiers_init["num_layers"] = 1
 
     if seq_len_interpolation_factor is not None:
         config_modifiers_init["seq_len_interpolation_factor"] = seq_len_interpolation_factor

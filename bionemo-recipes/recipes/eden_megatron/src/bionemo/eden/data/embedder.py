@@ -21,31 +21,59 @@ import torch
 from megatron.core import parallel_state
 from nemo.collections.llm.gpt.model.base import GPTModel
 from nemo.collections.llm.gpt.model.hyena import HyenaModel
-from nemo.utils import logging as logger
 from torch import Tensor
 
 from bionemo.evo2.models.mamba import MambaModel
-from bionemo.evo2.run.predict import _gather_along_cp_dim
-
-# Import BasePredictor and helper from predict.py
-# Assuming BasePredictor is just LightningPassthroughPredictionMixin as per docs,
-# but in predict.py HyenaPredictor inherits HyenaModel.
-# Wait, predict.py doesn't define HyenaPredictor explicitly, it just instantiates HyenaModel.
-# But HyenaModel inherits LightningPassthroughPredictionMixin?
-# Let's check HyenaModel definition in NeMo if possible, but we can't.
-# However, `predict.py` imports `LightningPassthroughPredictionMixin` from `bionemo.llm.lightning`.
-# The design doc says:
-# class HyenaEmbedder(EmbeddingExtractorMixin, HyenaModel): pass
-# And EmbeddingExtractorMixin(BasePredictor).
-# "BasePredictor" is marked as [existing] in diagram and mapped to LightningPassthroughPredictionMixin in text.
-# So I will use LightningPassthroughPredictionMixin as the base if there is no explicit BasePredictor class.
-from bionemo.llm.lightning import LightningPassthroughPredictionMixin
+from bionemo.evo2.run.predict import BasePredictor, _gather_along_cp_dim
 
 
 PoolingStrategy = Literal["mean", "max", "last", "first", "per_token"]
 
 
-class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
+def _unshuffle_zigzag(tensor: Tensor, cp_size: int, seq_dim: int = 1) -> Tensor:
+    """Restore original sequence order from zigzag-packed tensor.
+
+    After Context Parallel gather, sequences are in zigzag order:
+    [chunk_0, chunk_{2*cp_size-1}, chunk_1, chunk_{2*cp_size-2}, ...]
+
+    This function restores the original sequential order:
+    [chunk_0, chunk_1, chunk_2, ..., chunk_{2*cp_size-1}]
+
+    Args:
+        tensor: Tensor with zigzag-ordered sequence dimension
+        cp_size: Context parallel world size
+        seq_dim: Which dimension contains the sequence (default: 1)
+
+    Returns:
+        Tensor with original sequence ordering
+
+    Examples:
+        >>> # With CP=2, input has 4 chunks in zigzag order: [0,3,1,2]
+        >>> # Output should be: [0,1,2,3]
+        >>> tensor = torch.tensor([[0,0,3,3,1,1,2,2]])  # [B, S]
+        >>> result = _unshuffle_zigzag(tensor, cp_size=2, seq_dim=1)
+        >>> # result: [[0,0,1,1,2,2,3,3]]
+    """
+    if cp_size == 1:
+        return tensor
+
+    num_chunks = 2 * cp_size
+    chunks = list(tensor.chunk(num_chunks, dim=seq_dim))
+
+    # Reconstruct original order from zigzag pattern
+    # Zigzag pattern: rank r gets chunks [r*2, num_chunks - 1 - r*2]
+    original_order = [None] * num_chunks
+    chunk_idx = 0
+    for rank in range(cp_size):
+        original_order[rank * 2] = chunks[chunk_idx]
+        chunk_idx += 1
+        original_order[num_chunks - 1 - rank * 2] = chunks[chunk_idx]
+        chunk_idx += 1
+
+    return torch.cat(original_order, dim=seq_dim)
+
+
+class EmbeddingExtractorMixin(BasePredictor):
     """Mixin providing embedding extraction capabilities.
 
     This mixin overrides predict_step() to return hidden state embeddings
@@ -67,6 +95,15 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
         include_final_norm: bool = True,
         **kwargs,
     ):
+        """Initialize embedding extraction mixin.
+
+        Args:
+            *args: Additional positional arguments passed to parent class.
+            embedding_layer: Which layer to extract embeddings from. None for all layers, 0 for embedding layer only.
+            pooling_strategy: How to pool sequence-level embeddings.
+            include_final_norm: Whether to apply final layer norm.
+            **kwargs: Additional keyword arguments passed to parent class.
+        """
         # Remove embedding-specific args before passing to parent
         # We need to filter kwargs commonly passed to the model constructor if they are not expected by parent
         # But here we are mixing in. The model __init__ will likely consume these if we don't handle them?
@@ -78,7 +115,6 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
         self.embedding_layer = embedding_layer
         self.pooling_strategy = pooling_strategy
         self.include_final_norm = include_final_norm
-        self._cp_unshuffle_warning_shown = False
 
     def predict_step(
         self, batch: Dict[str, Tensor], batch_idx: Optional[int] = None, to_cpu: bool = True
@@ -101,11 +137,19 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
             return None
 
         # Ensure we are in eval mode
-        if self.training:
-            self.eval()
+        assert not self.training, "predict_step should be called in eval mode. Call model.eval() before predict."
 
         with torch.no_grad():
             hidden_states = self.forward_for_embeddings(batch)
+
+        # Gather across TP ranks if hidden dimension is sharded
+        tp_world_size = parallel_state.get_tensor_model_parallel_world_size()
+        if tp_world_size > 1:
+            from megatron.core.tensor_parallel.mappings import _gather_along_last_dim
+
+            hidden_states = _gather_along_last_dim(
+                hidden_states, group=parallel_state.get_tensor_model_parallel_group()
+            )
 
         if not parallel_state.is_pipeline_last_stage():
             return None
@@ -115,20 +159,11 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
         hidden_gathered = _gather_along_cp_dim(hidden_states, seq_dim=1)
         loss_mask_gathered = _gather_along_cp_dim(batch["loss_mask"])
 
-        # We also need to gather tokens if we were returning them, but we aren't.
-        # But we need loss_mask for pooling.
-
-        # Handle zigzag for position-sensitive pooling
+        # Unshuffle zigzag ordering for position-sensitive pooling
         cp_size = parallel_state.get_context_parallel_world_size()
         if self.pooling_strategy in ("last", "per_token") and cp_size > 1:
-            if not self._cp_unshuffle_warning_shown:
-                # Warn user about zigzag ordering
-                logger.warning(
-                    "Using position-sensitive pooling with CP > 1. "
-                    "Results are in zigzag order. Use _unshuffle_zigzag() "
-                    "to restore original sequence order if needed."
-                )
-                self._cp_unshuffle_warning_shown = True
+            hidden_gathered = _unshuffle_zigzag(hidden_gathered, cp_size, seq_dim=1)
+            loss_mask_gathered = _unshuffle_zigzag(loss_mask_gathered, cp_size, seq_dim=1)
 
         # Apply pooling
         embeddings = self._pool_hidden_states(
@@ -243,7 +278,22 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
         Returns:
             Pooled embeddings: [B, H] for most strategies,
             [B, S, H] for per_token
+
+        Raises:
+            ValueError: If any sequence has no valid tokens and strategy
+                requires valid tokens (mean, max, last)
         """
+        # Validate that sequences have valid tokens (except for per_token)
+        if strategy != "per_token":
+            batch_has_valid = mask.any(dim=1)
+            if not batch_has_valid.all():
+                invalid_indices = torch.where(~batch_has_valid)[0].tolist()
+                raise ValueError(
+                    f"Cannot apply '{strategy}' pooling to sequences with no valid tokens. "
+                    f"Batch items with all-False masks: {invalid_indices}. "
+                    f"Check your input sequences for empty/all-padding data."
+                )
+
         mask_float = mask.float().unsqueeze(-1)  # [B, S, 1]
 
         if strategy == "per_token":
@@ -255,13 +305,12 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
             return masked_sum / valid_counts
 
         elif strategy == "max":
-            # Mask invalid positions with -inf
+            # Validation already done above
             masked = hidden_states.masked_fill(~mask.unsqueeze(-1).bool(), float("-inf"))
-            # max returns (values, indices)
             return masked.max(dim=1).values
 
         elif strategy == "last":
-            # Find the index of the last valid token
+            # Validation already done above
             seq_lengths = mask.sum(dim=1).long() - 1
             seq_lengths = seq_lengths.clamp(min=0)
             batch_idx = torch.arange(hidden_states.size(0), device=hidden_states.device)
@@ -275,9 +324,16 @@ class EmbeddingExtractorMixin(LightningPassthroughPredictionMixin):
 
 
 class HyenaEmbedder(EmbeddingExtractorMixin, HyenaModel):
-    """Hyena model with embedding extraction capabilities."""
+    """Hyena model for embedding extraction.
 
-    pass
+    Combines EmbeddingExtractorMixin with HyenaModel to provide
+    embedding extraction capabilities for Evo2 Hyena models.
+    """
+
+    def configure_model(self, *args, **kwargs) -> None:
+        """Configure the model."""
+        super().configure_model(*args, **kwargs)
+        self.trainer.strategy._init_model_parallel = True
 
 
 class MambaEmbedder(EmbeddingExtractorMixin, MambaModel):
