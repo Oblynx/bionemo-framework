@@ -7,10 +7,8 @@ mkdir -p ~/.cache/pre-commit-devcontainer
 mkdir -p ~/.gnupg
 mkdir -p ~/.config
 mkdir -p ~/.cursor
-mkdir -p ~/.claude
+# ~/.claude is built inside the container by fix-claude-paths.sh from ~/.claude_host
 [ ! -f ~/.netrc ] && touch ~/.netrc
-
 [ ! -f ~/.bash_history_devcontainer ] && touch ~/.bash_history_devcontainer
-[ ! -f ~/.claude.json ] && touch ~/.claude.json
 
 exit 0

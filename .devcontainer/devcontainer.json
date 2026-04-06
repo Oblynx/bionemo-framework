@@ -6,8 +6,8 @@
     "mounts": [
         "source=${localEnv:HOME}/.bash_history_devcontainer,target=/home/ubuntu/.bash_history,type=bind,consistency=cached",
         "source=${localEnv:HOME}/.cache,target=/home/ubuntu/.cache,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.claude,target=/home/ubuntu/.claude,type=bind,consistency=cached",
-        "source=${localEnv:HOME}/.claude.json,target=/home/ubuntu/.claude.json,type=bind,consistency=cached",
+        "source=${localEnv:HOME}/.claude,target=/home/ubuntu/.claude_host,type=bind,consistency=consistent",
+        "source=${localEnv:HOME}/.claude.json,target=/home/ubuntu/.claude.json,type=bind,consistency=consistent",
         "source=${localEnv:HOME}/.config,target=/home/ubuntu/.config,type=bind,consistency=cached",
         "source=${localEnv:HOME}/.cursor,target=/home/ubuntu/.cursor,type=bind,consistency=cached",
         "source=${localEnv:HOME}/.gnupg,target=/home/ubuntu/.gnupg,type=bind,consistency=cached",
@@ -15,19 +15,23 @@
         "source=${localEnv:HOME}/.ssh,target=/home/ubuntu/.ssh,readonly,type=bind,consistency=cached"
     ],
     "postCreateCommand": ".devcontainer/postCreateCommand.sh",
+    "postStartCommand": ".devcontainer/fix-claude-paths.sh",
     "initializeCommand": ".devcontainer/initializeCommand.sh",
     "remoteUser": "ubuntu",
     "runArgs": [
-        "--gpus=all",
+        //"--gpus=all",
         "--shm-size=4g"
     ],
     "containerEnv": {
         "PRE_COMMIT_HOME": "/home/ubuntu/.cache/pre-commit-devcontainer"
     },
+    "remoteEnv": {
+        "CLAUDE_CODE_OAUTH_TOKEN": "${localEnv:CLAUDE_CODE_OAUTH_TOKEN}"
+    },
     "customizations": {
         "vscode": {
             "extensions": [
-                "Anthropic.claude-code",
+                "Anthropic.claude-code@2.1.90",
                 "charliermarsh.ruff",
                 "eamodio.gitlens",
                 "ms-azuretools.vscode-docker",

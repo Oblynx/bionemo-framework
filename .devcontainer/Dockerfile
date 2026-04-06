@@ -12,7 +12,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/
 USER ubuntu
-RUN curl https://cursor.com/install -fsS | bash  # Install cursor-agent CLI tool
-RUN curl -fsSL https://claude.ai/install.sh | bash  # Install Claude CLI tool
 RUN uv tool install pre-commit --with pre-commit-uv --force-reinstall
 ENV PATH="/home/ubuntu/.local/bin:${PATH}"
+# Link the claude CLI from the VS Code extension on each shell start.
+# Extensions are installed after all devcontainer lifecycle hooks, so ~/.bashrc
+# is the earliest reliable place to do this.
+RUN printf '\n# Link claude CLI from VS Code extension into PATH\n_b=$(find ~/.vscode-server/extensions -name "claude" -path "*/native-binary/claude" 2>/dev/null | head -1); [ -x "$_b" ] && ln -sf "$_b" ~/.local/bin/claude; unset _b\n' >> /home/ubuntu/.bashrc
